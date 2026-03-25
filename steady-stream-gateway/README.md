@@ -1,28 +1,28 @@
-# Steady Stream Gateway
+# 🏆 Steady Stream API Gateway
 
-A production-grade, high-performance API gateway built with Go, featuring **Atomic GCRA** rate limiting and **Lock-Striping** for extreme concurrency.
+[![Hackathon Grader](https://github.com/shubham217/golang_hackathon/actions/workflows/grade.yml/badge.svg)](https://github.com/shubham217/golang_hackathon/actions/workflows/grade.yml)
 
-## Advanced Architecture
+An ultra-high-performance API Gateway built in Go, featuring a **Lock-Free Per-IP Leaky Bucket** implementation. This gateway acts as a "steady stream" regulator, transforming bursty, unpredictable traffic into a constant, manageable flow for downstream microservices.
 
-### 1. Atomic GCRA (Leaky Bucket)
-Instead of traditional mutex-based buckets, this gateway uses the **Generic Cell Rate Algorithm (GCRA)** implemented with `sync/atomic`.
-*   **Lock-Free**: The `Allow()` operation uses `CompareAndSwapInt64`, eliminating mutex overhead and context switching.
-*   **Sub-nanosecond Precision**: Tracks "theoretical arrival time" in nanoseconds for perfect rate accuracy.
-*   **Predictive Backoff**: Returns the exact `Retry-After` duration to tell clients precisely when to try again.
+## 🚀 Key Features
 
-### 2. Lock-Striping (Sharding)
-The IP management layer is horizontally sharded into **64 independent shards**.
-*   **Concurrency**: Requests from different IPs are hashed into different shards, allowing parallel processing across CPU cores without global lock contention.
-*   **Non-Blocking GC**: Background cleanup sweeps shards one-by-one with micro-sleeps, preventing "Stop-The-World" latency spikes during memory reclamation.
+* **GCRA (Generic Cell Rate Algorithm)**: A mathematically optimized, lock-free version of the Leaky Bucket. It uses atomic `CompareAndSwap` (CAS) to eliminate mutex contention.
+* **Zero-Background Leak Logic**: Unlike traditional implementations, this "leaks" mathematically upon request arrival—no expensive background tickers required for individual buckets.
+* **Per-IP Isolation**: Protects against noisy neighbors and DDoS by tracking unique IP addresses with a thread-safe sharding strategy.
+* **Memory Leak Protection**: Implements an active background "sweeper" that purges stale IP buckets after 5 minutes of inactivity.
+* **Standard Library Only**: Built with 100% Go standard library—no external dependencies.
 
-### 3. Production Middleware
-*   **Real IP Detection**: Correct-handling of `X-Forwarded-For` headers for environments behind Nginx, AWS, or Cloudflare.
-*   **Standard Headers**:
-    *   `X-RateLimit-Limit`: Maximum burst capacity.
-    *   `X-RateLimit-Remaining`: Current tokens left for the IP.
-    *   `Retry-After`: Seconds to wait (sent on 429).
+## 🧠 Technical Deep Dive: GCRA
 
-## Request Lifecycle Flowchart
+The gateway utilizes the **Generic Cell Rate Algorithm (GCRA)**. Instead of tracking water levels, we track the **Theoretical Arrival Time (TAT)**.
+
+1.  **Arrival**: When a request hits the gateway, we calculate the next available "slot" ($TAT + Interval$).
+2.  **Compliance**: If the required wait time ($TAT - now$) exceeds the allowed **Burst Tolerance**, the request is rejected with `HTTP 429`.
+3.  **Atomic Update**: We use `sync/atomic` to update the $TAT$ variable, ensuring that thousands of concurrent requests can be processed with nanosecond latency.
+
+## 📊 Request Lifecycle Flowchart
+
+The following flowchart illustrates how the `RateLimitMiddleware` handles an incoming request using the sharded manager and atomic buckets:
 
 ```mermaid
 graph TD
@@ -41,17 +41,23 @@ graph TD
     F --> H[Execute Backend Service]
 ```
 
-## Getting Started
+## 🚦 Getting Started
 
 ### Prerequisites
-- Go 1.24 or later
+* **Go**: v1.24+
+* **Load Tester**: `hey`
+    ```bash
+    go install github.com/rakyll/hey@latest
+    ```
 
-### Running the server
+### Installation
 ```bash
-go run main.go
+git clone https://github.com/shubham217/golang_hackathon.git
+cd golang_hackathon/steady-stream-gateway
+go run .
 ```
 
-### Running Tests (Highly Recommended)
+### Running Tests
 ```bash
 go test -v ./...
 ```
