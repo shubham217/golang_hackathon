@@ -9,24 +9,24 @@ import (
 )
 
 func TestIPRateLimiter_Isolation(t *testing.T) {
-	manager := NewIPRateLimiter(2, 100*time.Millisecond)
+	manager := NewShardedIPRateLimiter(4, 2, 100*time.Millisecond)
 	ip1, ip2 := "192.168.1.1", "10.0.0.1"
 
 	limiter1 := manager.GetLimiter(ip1)
 	limiter1.Allow()
 	limiter1.Allow()
-	if limiter1.Allow() {
+	if allowed, _, _ := limiter1.Allow(); allowed {
 		t.Errorf("IP1 should be rate limited")
 	}
 
 	limiter2 := manager.GetLimiter(ip2)
-	if !limiter2.Allow() {
+	if allowed, _, _ := limiter2.Allow(); !allowed {
 		t.Errorf("IP2 should have an empty bucket and be allowed")
 	}
 }
 
 func TestRateLimitMiddleware(t *testing.T) {
-	manager := NewIPRateLimiter(1, 10*time.Second)
+	manager := NewShardedIPRateLimiter(4, 1, 10*time.Second)
 	handler := RateLimitMiddleware(manager, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -48,7 +48,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 }
 
 func TestIPRateLimiter_Concurrency(t *testing.T) {
-	manager := NewIPRateLimiter(500, time.Millisecond)
+	manager := NewShardedIPRateLimiter(16, 500, time.Millisecond)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)

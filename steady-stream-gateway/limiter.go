@@ -1,138 +1,176 @@
 package main
 
 import (
+	"fmt"
+	"hash/fnv"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Limiter defines the behavior of a single rate limiter.
 type Limiter interface {
-	Allow() bool
+	Allow() (bool, int, time.Duration)
 	LastAccessed() time.Time
 }
 
-// leakyBucket implements the Limiter interface using a time-based token refill.
-// This is mathematically equivalent to a leaky bucket used for rate limiting.
-type leakyBucket struct {
-	capacity     float64
-	refillRate   time.Duration // Time to add 1 token (leak interval)
-	tokens       float64
-	lastUpdate   time.Time
-	lastAccessed time.Time
-	mu           sync.Mutex
+// AtomicLeakyBucket implements the Generic Cell Rate Algorithm (GCRA).
+// It is completely lock-free for the Allow() operation.
+type AtomicLeakyBucket struct {
+	nextFreeTick int64 // Nanoseconds (UnixNano)
+	interval     int64 // Nanoseconds per request
+	maxBurst     int64 // Max nanoseconds we can "borrow" from the future
+	lastAccessed int64 // UnixNano for cleanup tracking
 }
 
-func (b *leakyBucket) Allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func NewAtomicBucket(capacity int, rate time.Duration) *AtomicLeakyBucket {
+	interval := int64(rate)
+	// GCRA: tau (maxBurst) = (limit - 1) * interval
+	burst := int64(capacity-1) * interval
+	if burst < 0 {
+		burst = 0
+	}
+	return &AtomicLeakyBucket{
+		interval:     interval,
+		maxBurst:     burst,
+		nextFreeTick: time.Now().UnixNano(),
+		lastAccessed: time.Now().UnixNano(),
+	}
+}
 
-	now := time.Now()
-	b.lastAccessed = now
+func (b *AtomicLeakyBucket) Allow() (bool, int, time.Duration) {
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&b.lastAccessed, now)
 
-	// If it's the first time, start with a full bucket
-	if b.lastUpdate.IsZero() {
-		b.tokens = b.capacity
-	} else {
-		// Calculate how many tokens "leaked" (refilled) since last check
-		elapsed := now.Sub(b.lastUpdate)
-		b.tokens += float64(elapsed) / float64(b.refillRate)
-		if b.tokens > b.capacity {
-			b.tokens = b.capacity
+	for {
+		next := atomic.LoadInt64(&b.nextFreeTick)
+
+		// Calculate when this request would theoretically be allowed
+		targetTime := next
+		if now > next {
+			targetTime = now
+		}
+
+		// If the target time is too far in the future, the "bucket" is full
+		diff := targetTime - now
+		if diff > b.maxBurst {
+			wait := time.Duration(diff - b.maxBurst)
+			return false, 0, wait
+		}
+
+		// Attempt to update. If next has changed since we loaded it, loop and try again.
+		newNext := targetTime + b.interval
+		if atomic.CompareAndSwapInt64(&b.nextFreeTick, next, newNext) {
+			remaining := int((b.maxBurst - diff) / b.interval)
+			return true, remaining, 0
 		}
 	}
+}
 
-	b.lastUpdate = now
+func (b *AtomicLeakyBucket) LastAccessed() time.Time {
+	return time.Unix(0, atomic.LoadInt64(&b.lastAccessed))
+}
 
-	// If we have at least one token, allow the request and consume the token
-	if b.tokens >= 1 {
-		b.tokens--
-		return true
+// ShardedIPRateLimiter manages shards of atomic buckets.
+type ShardedIPRateLimiter struct {
+	shards    []*shard
+	numShards int
+	capacity  int
+	rate      time.Duration
+}
+
+type shard struct {
+	ips map[string]Limiter
+	mu  sync.RWMutex
+}
+
+func NewShardedIPRateLimiter(numShards int, capacity int, rate time.Duration) *ShardedIPRateLimiter {
+	s := &ShardedIPRateLimiter{
+		shards:    make([]*shard, numShards),
+		numShards: numShards,
+		capacity:  capacity,
+		rate:      rate,
 	}
-
-	return false
-}
-
-func (b *leakyBucket) LastAccessed() time.Time {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.lastAccessed
-}
-
-// IPRateLimiter manages a separate leaky bucket for each IP address.
-type IPRateLimiter struct {
-	ips      map[string]Limiter
-	mu       sync.RWMutex
-	capacity int
-	rate     time.Duration
-}
-
-func NewIPRateLimiter(capacity int, rate time.Duration) *IPRateLimiter {
-	return &IPRateLimiter{
-		ips:      make(map[string]Limiter),
-		capacity: capacity,
-		rate:     rate,
+	for i := 0; i < numShards; i++ {
+		s.shards[i] = &shard{ips: make(map[string]Limiter)}
 	}
+	return s
 }
 
-func (i *IPRateLimiter) GetLimiter(ip string) Limiter {
-	// Optimistic Read Lock
-	i.mu.RLock()
-	limiter, exists := i.ips[ip]
-	i.mu.RUnlock()
+func (s *ShardedIPRateLimiter) getShard(ip string) *shard {
+	h := fnv.New32a()
+	h.Write([]byte(ip))
+	return s.shards[uint32(h.Sum32())%uint32(s.numShards)]
+}
+
+func (s *ShardedIPRateLimiter) GetLimiter(ip string) Limiter {
+	shard := s.getShard(ip)
+	
+	shard.mu.RLock()
+	limiter, exists := shard.ips[ip]
+	shard.mu.RUnlock()
 
 	if exists {
 		return limiter
 	}
 
-	// Write Lock for creating a new bucket
-	i.mu.Lock()
-	defer i.mu.Unlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	// Double check pattern for thread safety
-	if limiter, exists = i.ips[ip]; exists {
+	if limiter, exists = shard.ips[ip]; exists {
 		return limiter
 	}
 
-	limiter = &leakyBucket{
-		capacity:   float64(i.capacity),
-		refillRate: i.rate,
-	}
-	i.ips[ip] = limiter
+	limiter = NewAtomicBucket(s.capacity, s.rate)
+	shard.ips[ip] = limiter
 	return limiter
 }
 
-// RunBackgroundCleanup periodically removes stale IPs to prevent memory leaks.
-func (i *IPRateLimiter) RunBackgroundCleanup(interval time.Duration, maxAge time.Duration) {
+func (s *ShardedIPRateLimiter) RunBackgroundCleanup(interval time.Duration, maxAge time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
 		for range ticker.C {
-			i.mu.Lock()
-			now := time.Now()
-			for ip, limiter := range i.ips {
-				if now.Sub(limiter.LastAccessed()) > maxAge {
-					delete(i.ips, ip)
+			for i := 0; i < s.numShards; i++ {
+				shard := s.shards[i]
+				shard.mu.Lock()
+				now := time.Now()
+				for ip, limiter := range shard.ips {
+					if now.Sub(limiter.LastAccessed()) > maxAge {
+						delete(shard.ips, ip)
+					}
 				}
+				shard.mu.Unlock()
+				time.Sleep(time.Millisecond * 2)
 			}
-			i.mu.Unlock()
 		}
 	}()
 }
 
-// RateLimitMiddleware wraps an HTTP handler with Per-IP rate limiting.
-func RateLimitMiddleware(ipLimiter *IPRateLimiter, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract IP address, stripping the port
-		ip := r.RemoteAddr
-		if pos := strings.LastIndex(ip, ":"); pos != -1 {
-			ip = ip[:pos]
-		}
+func GetClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
 
+func RateLimitMiddleware(ipLimiter *ShardedIPRateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := GetClientIP(r)
 		limiter := ipLimiter.GetLimiter(ip)
-		if !limiter.Allow() {
-			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte("429 Too Many Requests: Rate limit exceeded\n"))
+		
+		allowed, remaining, retryAfter := limiter.Allow()
+		
+		w.Header().Set("X-RateLimit-Limit", fmt.Sprintf("%d", ipLimiter.capacity))
+		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+
+		if !allowed {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 
