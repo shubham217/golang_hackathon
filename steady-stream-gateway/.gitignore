@@ -1,0 +1,13 @@
+# Binaries
+bin/
+*.exe
+*.test
+*.prof
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Go
+go.sum
+vendor/
