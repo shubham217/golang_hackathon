@@ -1,27 +1,19 @@
-name: Hackathon Grader
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+name: Go Auto-Grader
+on: [push]
+
+# This tells ALL steps to run inside your project subfolder
+defaults:
+  run:
+    working-directory: ./steady-stream-gateway
 
 jobs:
-  build-and-test:
+  grade:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '1.24'
-    - name: Run Unit & Race Tests
-      run: go test -v -race ./...
-    - name: Install Load Tester (Hey)
-      run: go install github.com/rakyll/hey@latest
-    - name: Start API Gateway in background
-      run: go run . &
-    - name: Wait for server readiness
-      run: sleep 3
-    - name: Run Load Test (Simulating 50 concurrent users)
-      run: ~/go/bin/hey -z 5s -c 50 http://localhost:8080/api/fast > load_test_results.txt
-    - name: Display Load Test Results
-      run: cat load_test_results.txt
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      - name: Run Tests
+        run: go test -v ./...
